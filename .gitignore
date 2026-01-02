@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# Sample briefs (may contain confidential info)
+Sample_Briefs/
+
+# Output files
+*.json
+
+# Test output PDFs
+test_*.pdf
+annotated_*.pdf

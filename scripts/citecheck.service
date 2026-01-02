@@ -1,0 +1,26 @@
+[Unit]
+Description=CiteCheck API Server
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=mb
+Group=mb
+WorkingDirectory=/home/mb/github/citecheck/backend
+Environment="PATH=/home/mb/github/citecheck/venv/bin"
+EnvironmentFile=/home/mb/github/citecheck/.env
+ExecStart=/home/mb/github/citecheck/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/var/log/citecheck/access.log
+StandardError=append:/var/log/citecheck/error.log
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
