@@ -87,6 +87,90 @@ PAREN_VERBS = [
     'citing', 'discussing', 'describing', 'providing', 'defining',
 ]
 
+# Wetslaw case law base directory
+WETSLAW_BASE = "/mnt/wetslaw/data/case.law"
+
+# Reporter to directory slug mapping
+REPORTER_SLUGS = {
+    # South Western Reporter
+    'S.W.': 'sw',
+    'S.W.2d': 'sw2d',
+    'S.W.3d': 'sw3d',
+    # Other regional reporters
+    'N.W.': 'nw',
+    'N.W.2d': 'nw2d',
+    'N.E.': 'ne',
+    'N.E.2d': 'ne2d',
+    'N.E.3d': 'ne3d',
+    'S.E.': 'se',
+    'S.E.2d': 'se2d',
+    'So.': 'so',
+    'So.2d': 'so2d',
+    'So.3d': 'so3d',
+    'P.': 'p',
+    'P.2d': 'p2d',
+    'P.3d': 'p3d',
+    # Federal reporters
+    'F.': 'f',
+    'F.2d': 'f2d',
+    'F.3d': 'f3d',
+    'F.4th': 'f4th',
+    'F. Supp.': 'f-supp',
+    'F. Supp. 2d': 'f-supp-2d',
+    'F. Supp. 3d': 'f-supp-3d',
+    # Supreme Court
+    'U.S.': 'us',
+    'S. Ct.': 's-ct',
+    'L. Ed.': 'l-ed',
+    'L. Ed. 2d': 'l-ed-2d',
+    # Texas specific
+    'Tex.': 'tex',
+    'Tex. Crim.': 'tex-crim',
+    'Tex. Crim. App.': 'tex-crim',
+    'Tex. App.': 'tex-ct-app',
+    'Tex. Civ. App.': 'tex-civ-app',
+}
+
+
+def get_reporter_slug(reporter: str) -> Optional[str]:
+    """Convert a reporter name to its directory slug."""
+    return REPORTER_SLUGS.get(reporter)
+
+
+def get_local_case_paths(volume: str, reporter: str, page: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get the local file paths for a case.
+
+    Returns:
+        Tuple of (json_path, html_path), either may be None if reporter not supported
+    """
+    slug = get_reporter_slug(reporter)
+    if not slug:
+        return None, None
+
+    # Pad page to 4 digits
+    page_padded = page.zfill(4)
+
+    json_path = f"{WETSLAW_BASE}/{slug}/{volume}/json/{page_padded}-01.json"
+    html_path = f"{WETSLAW_BASE}/{slug}/{volume}/html/{page_padded}-01.html"
+
+    return json_path, html_path
+
+
+def check_local_case_exists(volume: str, reporter: str, page: str) -> Tuple[bool, bool]:
+    """
+    Check if local case files exist.
+
+    Returns:
+        Tuple of (json_exists, html_exists)
+    """
+    json_path, html_path = get_local_case_paths(volume, reporter, page)
+
+    json_exists = json_path and os.path.exists(json_path)
+    html_exists = html_path and os.path.exists(html_path)
+
+    return json_exists, html_exists
+
 
 class CourtListenerClient:
     """Client for CourtListener API with caching."""
@@ -160,6 +244,158 @@ class CourtListenerClient:
         if record:
             return record.get('caseName')
         return None
+
+    def get_cluster(self, cluster_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch full cluster data from CourtListener."""
+        if not self.api_token:
+            return None
+
+        try:
+            response = requests.get(
+                f"https://www.courtlistener.com/api/rest/v4/clusters/{cluster_id}/",
+                headers={"Authorization": f"Token {self.api_token}"},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                return response.json()
+        except requests.RequestException:
+            pass
+        return None
+
+    def get_opinion(self, opinion_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch full opinion data from CourtListener."""
+        if not self.api_token:
+            return None
+
+        try:
+            response = requests.get(
+                f"https://www.courtlistener.com/api/rest/v4/opinions/{opinion_id}/",
+                headers={"Authorization": f"Token {self.api_token}"},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                return response.json()
+        except requests.RequestException:
+            pass
+        return None
+
+    def download_case(self, volume: str, reporter: str, page: str) -> Tuple[bool, bool]:
+        """
+        Download case from CourtListener and save to wetslaw directory.
+
+        Returns:
+            Tuple of (json_saved, html_saved)
+        """
+        if not self.api_token:
+            return False, False
+
+        # First look up the case to get cluster_id
+        record = self.lookup_citation(volume, reporter, page)
+        if not record:
+            return False, False
+
+        cluster_id = record.get('cluster_id')
+        if not cluster_id:
+            return False, False
+
+        # Get full cluster data
+        cluster = self.get_cluster(cluster_id)
+        if not cluster:
+            return False, False
+
+        # Get paths
+        json_path, html_path = get_local_case_paths(volume, reporter, page)
+        if not json_path or not html_path:
+            return False, False
+
+        # Ensure directories exist
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        os.makedirs(os.path.dirname(html_path), exist_ok=True)
+
+        json_saved = False
+        html_saved = False
+
+        # Get opinions
+        opinions_data = []
+        html_parts = []
+        sub_opinions = cluster.get('sub_opinions', [])
+
+        for sub_op in sub_opinions:
+            # sub_op is a URL like "https://www.courtlistener.com/api/rest/v4/opinions/123/"
+            op_id = sub_op.rstrip('/').split('/')[-1]
+            try:
+                op_id = int(op_id)
+                opinion = self.get_opinion(op_id)
+                if opinion:
+                    # Collect opinion text
+                    op_text = opinion.get('plain_text') or ''
+                    op_html = opinion.get('html_with_citations') or opinion.get('html') or ''
+                    op_type = opinion.get('type', 'majority')
+
+                    opinions_data.append({
+                        'type': op_type,
+                        'text': op_text,
+                        'author': opinion.get('author_str', ''),
+                    })
+
+                    if op_html:
+                        html_parts.append(op_html)
+            except (ValueError, TypeError):
+                continue
+
+        # Build JSON in FLP-compatible format
+        flp_json = {
+            'id': cluster_id,
+            'name': cluster.get('case_name_full') or cluster.get('case_name', ''),
+            'name_abbreviation': cluster.get('case_name', ''),
+            'decision_date': cluster.get('date_filed', ''),
+            'docket_number': '',  # Not directly available
+            'first_page': page,
+            'last_page': '',
+            'citations': [{'type': 'official', 'cite': f"{volume} {reporter} {page}"}],
+            'court': {
+                'name': '',
+                'name_abbreviation': '',
+            },
+            'casebody': {
+                'judges': cluster.get('judges', ''),
+                'parties': cluster.get('case_name_full', ''),
+                'opinions': opinions_data,
+                'attorneys': cluster.get('attorneys', ''),
+            },
+            'source': 'courtlistener',
+            'cluster_id': cluster_id,
+            'absolute_url': cluster.get('absolute_url', ''),
+        }
+
+        # Save JSON
+        try:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(flp_json, f, indent=2, ensure_ascii=False)
+            json_saved = True
+        except (IOError, OSError):
+            pass
+
+        # Build and save HTML
+        if html_parts:
+            html_content = f'''<section class="casebody" data-case-id="{cluster_id}" data-firstpage="{page}">
+  <section class="head-matter">
+    <h4 class="parties">{cluster.get('case_name_full', cluster.get('case_name', ''))}</h4>
+    <p class="court">{cluster.get('court', '')}</p>
+    <p class="decisiondate">{cluster.get('date_filed', '')}</p>
+  </section>
+  <article class="opinion" data-type="majority">
+    {''.join(html_parts)}
+  </article>
+</section>'''
+            try:
+                with open(html_path, 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                html_saved = True
+            except (IOError, OSError):
+                pass
+
+        return json_saved, html_saved
 
 
 def normalize_case_name(name: str) -> str:
@@ -1079,6 +1315,140 @@ def propagate_cl_records(parsed: Dict) -> None:
                 process_citations(sent.get('citations', []))
 
 
+def add_local_case_paths(parsed: Dict, cl_client: Optional['CourtListenerClient'] = None,
+                         download_missing: bool = True) -> Dict[str, int]:
+    """
+    Add local file paths to all citations and optionally download missing cases.
+
+    Uses the CL record's start page (not the cited page) for file paths, so that
+    short cites and id cites point to the same file as the full citation.
+
+    Args:
+        parsed: The parsed brief data
+        cl_client: CourtListener client for downloading missing cases
+        download_missing: Whether to download missing cases from CL
+
+    Returns:
+        Stats dict with counts of local/downloaded/missing files
+    """
+    stats = {
+        'local_exists': 0,
+        'downloaded': 0,
+        'not_available': 0,
+        'no_cl_record': 0,
+        'unsupported_reporter': 0,
+    }
+
+    # Track processed cases to avoid duplicate work (by cluster_id)
+    processed_clusters: set = set()
+
+    def get_start_page_from_cl(cl_record: Dict, reporter: str) -> Optional[str]:
+        """Extract start page from CL record for the matching reporter."""
+        citations = cl_record.get('citation', [])
+        if isinstance(citations, list):
+            for c in citations:
+                if isinstance(c, str) and reporter in c:
+                    # Parse "265 S.W.3d 580" format
+                    parts = c.split()
+                    if len(parts) >= 3:
+                        return parts[-1]  # Last part is page
+        return None
+
+    def process_citation(cite: Dict) -> None:
+        cl_record = cite.get('cl_record')
+
+        # Must have CL record to get authoritative start page
+        if not cl_record:
+            stats['no_cl_record'] += 1
+            return
+
+        cluster_id = cl_record.get('cluster_id')
+
+        # Get volume/reporter from the citation
+        volume = cite.get('volume')
+        reporter = cite.get('reporter')
+
+        # For id cites, get volume/reporter from CL record
+        if cite.get('cite_type') == 'id' and (not volume or not reporter):
+            # Extract from CL citation list
+            citations = cl_record.get('citation', [])
+            for c in citations:
+                if isinstance(c, str):
+                    parts = c.split()
+                    if len(parts) >= 3:
+                        volume = parts[0]
+                        reporter = ' '.join(parts[1:-1])
+                        break
+
+        if not volume or not reporter:
+            stats['no_cl_record'] += 1
+            return
+
+        # Get start page from CL record (authoritative)
+        start_page = get_start_page_from_cl(cl_record, reporter)
+        if not start_page:
+            # Fallback to citation's page for full cites
+            start_page = cite.get('page')
+
+        if not start_page:
+            stats['no_cl_record'] += 1
+            return
+
+        # Check if reporter is supported
+        slug = get_reporter_slug(reporter)
+        if not slug:
+            stats['unsupported_reporter'] += 1
+            return
+
+        # Get paths using the START page (not pin cite page)
+        json_path, html_path = get_local_case_paths(volume, reporter, start_page)
+        cite['local_json_path'] = json_path
+        cite['local_html_path'] = html_path
+
+        # Skip if already processed this cluster
+        if cluster_id and cluster_id in processed_clusters:
+            # Still count as exists if files are there
+            if os.path.exists(json_path):
+                stats['local_exists'] += 1
+            return
+        if cluster_id:
+            processed_clusters.add(cluster_id)
+
+        # Check if files exist
+        json_exists = os.path.exists(json_path)
+        html_exists = os.path.exists(html_path)
+
+        if json_exists and html_exists:
+            stats['local_exists'] += 1
+            return
+
+        # Try to download if missing
+        if download_missing and cl_client:
+            json_saved, html_saved = cl_client.download_case(volume, reporter, start_page)
+            if json_saved or html_saved:
+                stats['downloaded'] += 1
+                return
+
+        stats['not_available'] += 1
+
+    # Process all citations in argument paragraphs
+    for para in parsed.get('argument', {}).get('paragraphs', []):
+        if para['type'] == 'block_quote':
+            for cite in para.get('citations', []):
+                process_citation(cite)
+        else:
+            for sent in para.get('sentences', []):
+                for cite in sent.get('citations', []):
+                    process_citation(cite)
+
+    # Also process propositions (which contain copies of citations)
+    for prop in parsed.get('propositions', []):
+        for cite in prop.get('citations', []):
+            process_citation(cite)
+
+    return stats
+
+
 def extract_propositions(parsed: Dict) -> List[Dict]:
     """
     Extract propositions from parsed argument structure.
@@ -1302,6 +1672,16 @@ def main():
             cite_names = [c.get('case_name') or c.get('text', '')[:25] for c in prop['citations'][:2]]
             print(f"  {i}. [{prop['type']}] {text}")
             print(f"     -> {cite_names}")
+
+        # Add local case paths and download missing cases
+        if cl_client:
+            print("\nAdding local case paths...", end=" ", flush=True)
+            path_stats = add_local_case_paths(parsed, cl_client, download_missing=True)
+            print(f"local: {path_stats['local_exists']}, "
+                  f"downloaded: {path_stats['downloaded']}, "
+                  f"missing: {path_stats['not_available']}, "
+                  f"no CL: {path_stats['no_cl_record']}, "
+                  f"unsupported: {path_stats['unsupported_reporter']}")
 
         # Save JSON
         output_file = pdf_path.replace('.pdf', '_parsed.json').replace('.PDF', '_parsed.json')
