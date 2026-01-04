@@ -43,11 +43,16 @@ import json
 import sys
 import os
 import requests
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
+from dotenv import load_dotenv
 import fitz  # PyMuPDF
+
+# Load .env from script directory
+load_dotenv(Path(__file__).parent / '.env')
 from eyecite import get_citations, clean_text
 from eyecite.models import (
     FullCaseCitation,
@@ -327,10 +332,18 @@ class CourtListenerClient:
                 op_id = int(op_id)
                 opinion = self.get_opinion(op_id)
                 if opinion:
-                    # Collect opinion text
+                    # Collect opinion text - prefer plain_text, fall back to HTML
                     op_text = opinion.get('plain_text') or ''
                     op_html = opinion.get('html_with_citations') or opinion.get('html') or ''
                     op_type = opinion.get('type', 'majority')
+
+                    # If no plain text, extract from HTML
+                    if not op_text and op_html:
+                        # Strip HTML tags to get plain text
+                        import html as html_module
+                        op_text = re.sub(r'<[^>]+>', ' ', op_html)
+                        op_text = html_module.unescape(op_text)
+                        op_text = ' '.join(op_text.split())
 
                     opinions_data.append({
                         'type': op_type,
