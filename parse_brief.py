@@ -865,17 +865,19 @@ class BriefParser:
     def extract_citations_from_sentence(self, sentence: str,
                                          last_full_cite: Optional[str] = None,
                                          last_cl_record: Optional[Dict] = None,
-                                         cl_client: Optional[CourtListenerClient] = None) -> Tuple[List[Citation], Optional[str], Optional[Dict]]:
+                                         full_cite_records: Optional[Dict[Tuple[str, str], Dict]] = None,
+                                         cl_client: Optional[CourtListenerClient] = None) -> Tuple[List[Citation], Optional[str], Optional[Dict], Dict[Tuple[str, str], Dict]]:
         """Extract citations from a sentence.
 
         Args:
             sentence: The sentence text to extract citations from
             last_full_cite: Case name of the last full citation (for id cite references)
-            last_cl_record: CL record of the last citation (for inheriting to short/id cites)
+            last_cl_record: CL record of the immediately preceding citation (for id cites)
+            full_cite_records: Dict mapping (volume, reporter) to CL record (for short cites)
             cl_client: CourtListener client for lookups
 
         Returns:
-            Tuple of (citations list, new last_full_cite, new last_cl_record)
+            Tuple of (citations, new_last_full_cite, new_last_cl_record, full_cite_records)
         """
         # Normalize for eyecite
         normalized = self.normalize_for_eyecite(sentence)
@@ -884,6 +886,8 @@ class BriefParser:
         citations = []
         new_last_full = last_full_cite
         new_last_cl_record = last_cl_record
+        if full_cite_records is None:
+            full_cite_records = {}
 
         for cite in eyecite_cites:
             start, end = cite.span()
@@ -918,8 +922,9 @@ class BriefParser:
                 cite_type = 'unknown'
 
             # CL lookup strategy:
-            # - Full cites: Look up on CourtListener API
-            # - Short/id cites: Inherit from preceding citation (don't call API)
+            # - Full cites: Look up on CourtListener API, store by (volume, reporter)
+            # - Short cites: Look up matching full cite by (volume, reporter)
+            # - Id cites: Inherit from immediately preceding citation
             cl_record = None
             case_name = None
 
@@ -929,10 +934,16 @@ class BriefParser:
                     cl_record = cl_client.lookup_citation(volume, reporter, page)
                     if cl_record:
                         case_name = cl_record.get('caseName')
-                        # Update tracking for subsequent short/id cites
-                        new_last_cl_record = cl_record
-            elif cite_type in ('short_case', 'id', 'supra'):
-                # Short cites and id cites inherit from the last citation's CL record
+                        # Store for later short cite matching
+                        full_cite_records[(volume, reporter)] = cl_record
+            elif cite_type == 'short_case':
+                # Short cites match back to their full cite by volume/reporter
+                if volume and reporter:
+                    cl_record = full_cite_records.get((volume, reporter))
+                    if cl_record:
+                        case_name = cl_record.get('caseName')
+            elif cite_type in ('id', 'supra'):
+                # Id cites inherit from immediately preceding citation
                 cl_record = new_last_cl_record
                 if cl_record:
                     case_name = cl_record.get('caseName')
@@ -966,11 +977,11 @@ class BriefParser:
             )
             citations.append(citation)
 
-            # Update last_cl_record for next citation in this sentence
+            # Track last CL record for id cites
             if cl_record:
                 new_last_cl_record = cl_record
 
-        return citations, new_last_full, new_last_cl_record
+        return citations, new_last_full, new_last_cl_record, full_cite_records
 
     def _get_case_name(self, cite) -> Optional[str]:
         """Extract clean case name from citation."""
@@ -1074,7 +1085,8 @@ class BriefParser:
         # Process each paragraph
         paragraphs = []
         last_full_cite = None
-        last_cl_record = None  # Track CL record for inheritance to short/id cites
+        last_cl_record = None  # Track CL record for id cites (preceding citation)
+        full_cite_records = {}  # Map (volume, reporter) -> CL record for short cite matching
 
         for raw_para in raw_paragraphs:
             para_text = ' '.join(b['text'] for b in raw_para['blocks'])
@@ -1094,8 +1106,8 @@ class BriefParser:
                             last_body['sentences'] = last_body['sentences'][:-1]
 
                 # Extract citations from block quote
-                citations, last_full_cite, last_cl_record = self.extract_citations_from_sentence(
-                    para_text, last_full_cite, last_cl_record, cl_client
+                citations, last_full_cite, last_cl_record, full_cite_records = self.extract_citations_from_sentence(
+                    para_text, last_full_cite, last_cl_record, full_cite_records, cl_client
                 )
 
                 para = {
@@ -1112,8 +1124,8 @@ class BriefParser:
                 for sent_text in sentences_text:
                     # Normalize the sentence so spans are consistent
                     normalized_sent = self.normalize_for_eyecite(sent_text)
-                    citations, last_full_cite, last_cl_record = self.extract_citations_from_sentence(
-                        normalized_sent, last_full_cite, last_cl_record, cl_client
+                    citations, last_full_cite, last_cl_record, full_cite_records = self.extract_citations_from_sentence(
+                        normalized_sent, last_full_cite, last_cl_record, full_cite_records, cl_client
                     )
                     sentences.append({
                         'text': normalized_sent,
@@ -1263,10 +1275,8 @@ def propagate_cl_records(parsed: Dict) -> None:
         if pin_page < start_page:
             return False
 
-        # Page shouldn't be absurdly far from start (500 pages max)
-        # Note: Some reporters have multiple cases per volume, so pin cites
-        # can legitimately be far from the start page
-        if pin_page > start_page + 500:
+        # Page shouldn't be too far from start (20 pages max for most opinions)
+        if pin_page > start_page + 20:
             return False
 
         return True
