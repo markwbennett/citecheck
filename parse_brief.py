@@ -864,14 +864,26 @@ class BriefParser:
 
     def extract_citations_from_sentence(self, sentence: str,
                                          last_full_cite: Optional[str] = None,
-                                         cl_client: Optional[CourtListenerClient] = None) -> Tuple[List[Citation], Optional[str]]:
-        """Extract citations from a sentence."""
+                                         last_cl_record: Optional[Dict] = None,
+                                         cl_client: Optional[CourtListenerClient] = None) -> Tuple[List[Citation], Optional[str], Optional[Dict]]:
+        """Extract citations from a sentence.
+
+        Args:
+            sentence: The sentence text to extract citations from
+            last_full_cite: Case name of the last full citation (for id cite references)
+            last_cl_record: CL record of the last citation (for inheriting to short/id cites)
+            cl_client: CourtListener client for lookups
+
+        Returns:
+            Tuple of (citations list, new last_full_cite, new last_cl_record)
+        """
         # Normalize for eyecite
         normalized = self.normalize_for_eyecite(sentence)
 
         eyecite_cites = get_citations(normalized)
         citations = []
         new_last_full = last_full_cite
+        new_last_cl_record = last_cl_record
 
         for cite in eyecite_cites:
             start, end = cite.span()
@@ -893,11 +905,35 @@ class BriefParser:
             if hasattr(cite, 'metadata') and cite.metadata:
                 pin_cite = getattr(cite.metadata, 'pin_cite', None)
 
-            # Try CourtListener lookup first for full citations
+            # Determine citation type first
+            if isinstance(cite, FullCaseCitation):
+                cite_type = 'full_case'
+            elif isinstance(cite, ShortCaseCitation):
+                cite_type = 'short_case'
+            elif isinstance(cite, IdCitation):
+                cite_type = 'id'
+            elif isinstance(cite, SupraCitation):
+                cite_type = 'supra'
+            else:
+                cite_type = 'unknown'
+
+            # CL lookup strategy:
+            # - Full cites: Look up on CourtListener API
+            # - Short/id cites: Inherit from preceding citation (don't call API)
             cl_record = None
             case_name = None
-            if cl_client and volume and reporter and page:
-                cl_record = cl_client.lookup_citation(volume, reporter, page)
+
+            if cite_type == 'full_case':
+                # Only full cites get CL API lookup
+                if cl_client and volume and reporter and page:
+                    cl_record = cl_client.lookup_citation(volume, reporter, page)
+                    if cl_record:
+                        case_name = cl_record.get('caseName')
+                        # Update tracking for subsequent short/id cites
+                        new_last_cl_record = cl_record
+            elif cite_type in ('short_case', 'id', 'supra'):
+                # Short cites and id cites inherit from the last citation's CL record
+                cl_record = new_last_cl_record
                 if cl_record:
                     case_name = cl_record.get('caseName')
 
@@ -913,18 +949,6 @@ class BriefParser:
 
             # Check for parenthetical after citation
             parenthetical = self._find_parenthetical_after(normalized, end)
-
-            # Determine citation type
-            if isinstance(cite, FullCaseCitation):
-                cite_type = 'full_case'
-            elif isinstance(cite, ShortCaseCitation):
-                cite_type = 'short_case'
-            elif isinstance(cite, IdCitation):
-                cite_type = 'id'
-            elif isinstance(cite, SupraCitation):
-                cite_type = 'supra'
-            else:
-                cite_type = 'unknown'
 
             citation = Citation(
                 text=cite_text,
@@ -942,7 +966,11 @@ class BriefParser:
             )
             citations.append(citation)
 
-        return citations, new_last_full
+            # Update last_cl_record for next citation in this sentence
+            if cl_record:
+                new_last_cl_record = cl_record
+
+        return citations, new_last_full, new_last_cl_record
 
     def _get_case_name(self, cite) -> Optional[str]:
         """Extract clean case name from citation."""
@@ -1046,6 +1074,7 @@ class BriefParser:
         # Process each paragraph
         paragraphs = []
         last_full_cite = None
+        last_cl_record = None  # Track CL record for inheritance to short/id cites
 
         for raw_para in raw_paragraphs:
             para_text = ' '.join(b['text'] for b in raw_para['blocks'])
@@ -1065,8 +1094,8 @@ class BriefParser:
                             last_body['sentences'] = last_body['sentences'][:-1]
 
                 # Extract citations from block quote
-                citations, last_full_cite = self.extract_citations_from_sentence(
-                    para_text, last_full_cite, cl_client
+                citations, last_full_cite, last_cl_record = self.extract_citations_from_sentence(
+                    para_text, last_full_cite, last_cl_record, cl_client
                 )
 
                 para = {
@@ -1083,8 +1112,8 @@ class BriefParser:
                 for sent_text in sentences_text:
                     # Normalize the sentence so spans are consistent
                     normalized_sent = self.normalize_for_eyecite(sent_text)
-                    citations, last_full_cite = self.extract_citations_from_sentence(
-                        normalized_sent, last_full_cite, cl_client
+                    citations, last_full_cite, last_cl_record = self.extract_citations_from_sentence(
+                        normalized_sent, last_full_cite, last_cl_record, cl_client
                     )
                     sentences.append({
                         'text': normalized_sent,
